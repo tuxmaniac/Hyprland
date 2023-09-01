@@ -11,7 +11,7 @@
   fetchFromGitLab
 }:
 wlroots.overrideAttrs (old: {
-  inherit version src enableXWayland;
+  inherit version enableXWayland;
 
   pname = "${old.pname}-hyprland${lib.optionalString enableNvidiaPatches "-nvidia"}";
 
