@@ -1,0 +1,1120 @@
+diff --git a/backend/drm/atomic.c b/backend/drm/atomic.c
+index c8ffaff6..19dbec10 100644
+--- a/backend/drm/atomic.c
++++ b/backend/drm/atomic.c
+@@ -207,7 +207,7 @@ static void plane_disable(struct atomic *atom, struct wlr_drm_plane *plane) {
+ 
+ static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
+ 		struct wlr_drm_plane *plane, struct wlr_drm_fb *fb, uint32_t crtc_id,
+-		int32_t x, int32_t y) {
++		int32_t x, int32_t y, struct wlr_box *src_box, struct wlr_box *dst_box) {
+ 	uint32_t id = plane->id;
+ 	const union wlr_drm_plane_props *props = &plane->props;
+ 
+@@ -217,20 +217,35 @@ static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
+ 		return;
+ 	}
+ 
+-	uint32_t width = fb->wlr_buf->width;
+-	uint32_t height = fb->wlr_buf->height;
++	struct wlr_box tmp_src_box;
++	if (src_box == NULL) {
++		tmp_src_box.x = 0;
++		tmp_src_box.y = 0;
++		tmp_src_box.width = fb->wlr_buf->width;
++		tmp_src_box.height = fb->wlr_buf->height;
++		src_box = &tmp_src_box;
++	}
++
++	struct wlr_box tmp_dst_box;
++	if (dst_box == NULL) {
++		tmp_dst_box.x = x; /* TODO: scale x,y inside of dst_box? */
++		tmp_dst_box.y = y;
++		tmp_dst_box.width = src_box->width;
++		tmp_dst_box.height = src_box->height;
++		dst_box = &tmp_dst_box;
++	}
+ 
+ 	// The src_* properties are in 16.16 fixed point
+-	atomic_add(atom, id, props->src_x, 0);
+-	atomic_add(atom, id, props->src_y, 0);
+-	atomic_add(atom, id, props->src_w, (uint64_t)width << 16);
+-	atomic_add(atom, id, props->src_h, (uint64_t)height << 16);
+-	atomic_add(atom, id, props->crtc_w, width);
+-	atomic_add(atom, id, props->crtc_h, height);
++	atomic_add(atom, id, props->src_x, (uint64_t)src_box->x << 16);
++	atomic_add(atom, id, props->src_y, (uint64_t)src_box->y << 16);
++	atomic_add(atom, id, props->src_w, (uint64_t)src_box->width << 16);
++	atomic_add(atom, id, props->src_h, (uint64_t)src_box->height << 16);
++	atomic_add(atom, id, props->crtc_x, dst_box->x);
++	atomic_add(atom, id, props->crtc_y, dst_box->y);
++	atomic_add(atom, id, props->crtc_w, dst_box->width);
++	atomic_add(atom, id, props->crtc_h, dst_box->height);
+ 	atomic_add(atom, id, props->fb_id, fb->id);
+ 	atomic_add(atom, id, props->crtc_id, crtc_id);
+-	atomic_add(atom, id, props->crtc_x, (uint64_t)x);
+-	atomic_add(atom, id, props->crtc_y, (uint64_t)y);
+ }
+ 
+ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
+@@ -329,8 +344,15 @@ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
+ 		if (crtc->props.vrr_enabled != 0) {
+ 			atomic_add(&atom, crtc->id, crtc->props.vrr_enabled, vrr_enabled);
+ 		}
+-		set_plane_props(&atom, drm, crtc->primary, state->primary_fb, crtc->id,
+-			0, 0);
++		struct wlr_box *src_box = NULL;
++		if (state->base->committed & WLR_OUTPUT_STATE_SRC_BOX) {
++			src_box = state->base->src_box;
++		}
++		struct wlr_box *dst_box = NULL;
++		if (state->base->committed & WLR_OUTPUT_STATE_DST_BOX) {
++			dst_box = state->base->dst_box;
++		}
++		set_plane_props(&atom, drm, crtc->primary, state->primary_fb, crtc->id, 0, 0, src_box, dst_box);
+ 		if (crtc->primary->props.fb_damage_clips != 0) {
+ 			atomic_add(&atom, crtc->primary->id,
+ 				crtc->primary->props.fb_damage_clips, fb_damage_clips);
+@@ -338,7 +360,7 @@ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
+ 		if (crtc->cursor) {
+ 			if (drm_connector_is_cursor_visible(conn)) {
+ 				set_plane_props(&atom, drm, crtc->cursor, get_next_cursor_fb(conn),
+-					crtc->id, conn->cursor_x, conn->cursor_y);
++					crtc->id, conn->cursor_x, conn->cursor_y, NULL, NULL);
+ 			} else {
+ 				plane_disable(&atom, crtc->cursor);
+ 			}
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index cc887a14..522aeabc 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -17,6 +17,7 @@
+ #include <wlr/interfaces/wlr_output.h>
+ #include <wlr/render/wlr_renderer.h>
+ #include <wlr/types/wlr_matrix.h>
++#include <wlr/types/wlr_output_group.h>
+ #include <wlr/util/box.h>
+ #include <wlr/util/log.h>
+ #include <xf86drm.h>
+@@ -41,7 +42,9 @@ static const uint32_t COMMIT_OUTPUT_STATE =
+ 	WLR_OUTPUT_STATE_ENABLED |
+ 	WLR_OUTPUT_STATE_GAMMA_LUT |
+ 	WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED |
+-	WLR_OUTPUT_STATE_LAYERS;
++	WLR_OUTPUT_STATE_LAYERS |
++	WLR_OUTPUT_STATE_SRC_BOX |
++	WLR_OUTPUT_STATE_DST_BOX;
+ 
+ static const uint32_t SUPPORTED_OUTPUT_STATE =
+ 	WLR_OUTPUT_STATE_BACKEND_OPTIONAL | COMMIT_OUTPUT_STATE;
+@@ -1430,6 +1433,12 @@ static bool connect_drm_connector(struct wlr_drm_connector *wlr_conn,
+ 	parse_edid(wlr_conn, edid_len, edid);
+ 	free(edid);
+ 
++	size_t tile_len = 0;
++	uint8_t *tile = get_drm_prop_blob(drm->fd,
++		wlr_conn->id, wlr_conn->props.tile, &tile_len);
++	parse_tile(wlr_conn, tile_len, tile);
++	free(tile);
++
+ 	char *subconnector = NULL;
+ 	if (wlr_conn->props.subconnector) {
+ 		subconnector = get_drm_prop_enum(drm->fd,
+@@ -1620,10 +1629,20 @@ void scan_drm_connectors(struct wlr_drm_backend *drm,
+ 
+ 	for (size_t i = 0; i < new_outputs_len; ++i) {
+ 		struct wlr_drm_connector *conn = new_outputs[i];
+-
+-		wlr_drm_conn_log(conn, WLR_INFO, "Requesting modeset");
+-		wl_signal_emit_mutable(&drm->backend.events.new_output,
+-			&conn->output);
++		if(conn->tile_info.group_id) {
++			struct wlr_output_group *group = wlr_output_group_match_tile(&conn->tile_info);
++			if (group) {
++				wlr_drm_conn_log(conn, WLR_INFO, "Adding %s to existing group", conn->name);
++			} else {
++				wlr_drm_conn_log(conn, WLR_INFO, "Creating output group for %s", conn->name);
++				group = wlr_output_group_create(conn->backend->display);
++			}
++			wlr_output_group_add_tile(group, &conn->output, &conn->tile_info);
++		} else {
++			wlr_drm_conn_log(conn, WLR_INFO, "Requesting modeset");
++			wl_signal_emit_mutable(&drm->backend.events.new_output,
++				&conn->output);
++		}
+ 	}
+ }
+ 
+diff --git a/backend/drm/libliftoff.c b/backend/drm/libliftoff.c
+index a6afb1f9..9cf80ae2 100644
+--- a/backend/drm/libliftoff.c
++++ b/backend/drm/libliftoff.c
+@@ -143,25 +143,41 @@ static void rollback_blob(struct wlr_drm_backend *drm,
+ }
+ 
+ static bool set_plane_props(struct wlr_drm_plane *plane,
+-		struct liftoff_layer *layer, struct wlr_drm_fb *fb, int32_t x, int32_t y, uint64_t zpos) {
++		struct liftoff_layer *layer, struct wlr_drm_fb *fb, int32_t x, int32_t y, uint64_t zpos,
++		struct wlr_box *src_box, struct wlr_box *dst_box) {
+ 	if (fb == NULL) {
+ 		wlr_log(WLR_ERROR, "Failed to acquire FB for plane %"PRIu32, plane->id);
+ 		return false;
+ 	}
+ 
+-	uint32_t width = fb->wlr_buf->width;
+-	uint32_t height = fb->wlr_buf->height;
++	struct wlr_box tmp_src_box;
++	if (src_box == NULL) {
++		tmp_src_box.x = 0;
++		tmp_src_box.y = 0;
++		tmp_src_box.width = fb->wlr_buf->width;
++		tmp_src_box.height = fb->wlr_buf->height;
++		src_box = &tmp_src_box;
++	}
++
++	struct wlr_box tmp_dst_box;
++	if (dst_box == NULL) {
++		tmp_dst_box.x = x; /* TODO: scale x,y in dst box */
++		tmp_dst_box.y = y;
++		tmp_dst_box.width = src_box->width;
++		tmp_dst_box.height = src_box->height;
++		dst_box = &tmp_dst_box;
++	}
+ 
+ 	// The SRC_* properties are in 16.16 fixed point
+ 	return liftoff_layer_set_property(layer, "zpos", zpos) == 0 &&
+-		liftoff_layer_set_property(layer, "SRC_X", 0) == 0 &&
+-		liftoff_layer_set_property(layer, "SRC_Y", 0) == 0 &&
+-		liftoff_layer_set_property(layer, "SRC_W", (uint64_t)width << 16) == 0 &&
+-		liftoff_layer_set_property(layer, "SRC_H", (uint64_t)height << 16) == 0 &&
+-		liftoff_layer_set_property(layer, "CRTC_X", (uint64_t)x) == 0 &&
+-		liftoff_layer_set_property(layer, "CRTC_Y", (uint64_t)y) == 0 &&
+-		liftoff_layer_set_property(layer, "CRTC_W", width) == 0 &&
+-		liftoff_layer_set_property(layer, "CRTC_H", height) == 0 &&
++		liftoff_layer_set_property(layer, "SRC_X", (uint64_t)src_box->x << 16) == 0 &&
++		liftoff_layer_set_property(layer, "SRC_Y", (uint64_t)src_box->y << 16) == 0 &&
++		liftoff_layer_set_property(layer, "SRC_W", (uint64_t)src_box->width << 16) == 0 &&
++		liftoff_layer_set_property(layer, "SRC_H", (uint64_t)src_box->height << 16) == 0 &&
++		liftoff_layer_set_property(layer, "CRTC_X", dst_box->x) == 0 &&
++		liftoff_layer_set_property(layer, "CRTC_Y", dst_box->y) == 0 &&
++		liftoff_layer_set_property(layer, "CRTC_W", dst_box->width) == 0 &&
++		liftoff_layer_set_property(layer, "CRTC_H", dst_box->height) == 0 &&
+ 		liftoff_layer_set_property(layer, "FB_ID", fb->id) == 0;
+ }
+ 
+@@ -383,9 +399,17 @@ static bool crtc_commit(struct wlr_drm_connector *conn,
+ 		if (crtc->props.vrr_enabled != 0) {
+ 			ok = ok && add_prop(req, crtc->id, crtc->props.vrr_enabled, vrr_enabled);
+ 		}
++		struct wlr_box *src_box = NULL;
++		if (state->base->committed & WLR_OUTPUT_STATE_SRC_BOX) {
++			src_box = state->base->src_box;
++		}
++		struct wlr_box *dst_box = NULL;
++		if (state->base->committed & WLR_OUTPUT_STATE_DST_BOX) {
++			dst_box = state->base->src_box;
++		}
+ 		ok = ok &&
+-			set_plane_props(crtc->primary, crtc->primary->liftoff_layer, state->primary_fb, 0, 0, 0) &&
+-			set_plane_props(crtc->primary, crtc->liftoff_composition_layer, state->primary_fb, 0, 0, 0);
++			set_plane_props(crtc->primary, crtc->primary->liftoff_layer, state->primary_fb, 0, 0, 0, src_box, dst_box) &&
++			set_plane_props(crtc->primary, crtc->liftoff_composition_layer, state->primary_fb, 0, 0, 0, src_box, dst_box);
+ 		liftoff_layer_set_property(crtc->primary->liftoff_layer,
+ 			"FB_DAMAGE_CLIPS", fb_damage_clips);
+ 		liftoff_layer_set_property(crtc->liftoff_composition_layer,
+@@ -402,7 +426,7 @@ static bool crtc_commit(struct wlr_drm_connector *conn,
+ 			if (drm_connector_is_cursor_visible(conn)) {
+ 				ok = ok && set_plane_props(crtc->cursor, crtc->cursor->liftoff_layer,
+ 					get_next_cursor_fb(conn), conn->cursor_x, conn->cursor_y,
+-					wl_list_length(&crtc->layers) + 1);
++					wl_list_length(&crtc->layers) + 1, NULL, NULL);
+ 			} else {
+ 				ok = ok && disable_plane(crtc->cursor);
+ 			}
+diff --git a/backend/drm/properties.c b/backend/drm/properties.c
+index 4f495177..feb586cb 100644
+--- a/backend/drm/properties.c
++++ b/backend/drm/properties.c
+@@ -25,6 +25,7 @@ static const struct prop_info connector_info[] = {
+ 	{ "DPMS", INDEX(dpms) },
+ 	{ "EDID", INDEX(edid) },
+ 	{ "PATH", INDEX(path) },
++	{ "TILE", INDEX(tile) },
+ 	{ "content type", INDEX(content_type) },
+ 	{ "link-status", INDEX(link_status) },
+ 	{ "max bpc", INDEX(max_bpc) },
+diff --git a/backend/drm/util.c b/backend/drm/util.c
+index 0e7f3f8b..cc7c6bfa 100644
+--- a/backend/drm/util.c
++++ b/backend/drm/util.c
+@@ -87,6 +87,47 @@ void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data)
+ 	di_info_destroy(info);
+ }
+ 
++void parse_tile(struct wlr_drm_connector *conn, size_t len, const uint8_t *data) {
++	struct wlr_output_group_tile_info *tile_info = &conn->tile_info;
++	memset(tile_info, 0, sizeof(*tile_info));
++	if (len == 0)
++		return;
++
++	// Reference:
++	// - include/linux/drm/drm_connector.h tile_blob_ptr
++	// - drivers/gpu/drm/drm_edid.c drm_parse_tiled_block()
++	//
++	// Note: group_id is always > 0
++	int ret = sscanf((char*)data, "%d:%d:%d:%d:%d:%d:%d:%d",
++		&tile_info->group_id,
++		&tile_info->is_single_monitor,
++		&tile_info->num_h,
++		&tile_info->num_v,
++		&tile_info->h_loc,
++		&tile_info->v_loc,
++		&tile_info->h_size,
++		&tile_info->v_size);
++	if(ret != 8) {
++		wlr_log(WLR_ERROR, "Unable to understand tile information for "
++			"connector %s", conn->name);
++		return;
++	}
++
++	wlr_log(WLR_INFO, "Connector '%s' TILE information: "
++		"group ID %d, single monitor %d, total %d horizontal tiles, "
++		"total %d vertical tiles, horizontal tile %d, vertical tile "
++		"%d, width %d, height %d",
++		conn->name,
++		tile_info->group_id,
++		tile_info->is_single_monitor,
++		tile_info->num_h,
++		tile_info->num_v,
++		tile_info->h_loc,
++		tile_info->v_loc,
++		tile_info->h_size,
++		tile_info->v_size);
++}
++
+ const char *drm_connector_status_str(drmModeConnection status) {
+ 	switch (status) {
+ 	case DRM_MODE_CONNECTED:
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index 4b92c5eb..aab64495 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -11,6 +11,7 @@
+ #include <wlr/backend/session.h>
+ #include <wlr/render/drm_format_set.h>
+ #include <wlr/types/wlr_output_layer.h>
++#include <wlr/types/wlr_output_group.h>
+ #include <xf86drmMode.h>
+ #include "backend/drm/iface.h"
+ #include "backend/drm/properties.h"
+@@ -161,6 +162,8 @@ struct wlr_drm_connector {
+ 	 * they're sent.
+ 	 */
+ 	uint32_t pending_page_flip_crtc;
++
++	struct wlr_output_group_tile_info tile_info;
+ };
+ 
+ struct wlr_drm_backend *get_drm_backend_from_backend(
+diff --git a/include/backend/drm/properties.h b/include/backend/drm/properties.h
+index b6ca14f1..1d79543a 100644
+--- a/include/backend/drm/properties.h
++++ b/include/backend/drm/properties.h
+@@ -22,12 +22,13 @@ union wlr_drm_connector_props {
+ 		uint32_t panel_orientation; // not guaranteed to exist
+ 		uint32_t content_type; // not guaranteed to exist
+ 		uint32_t max_bpc; // not guaranteed to exist
++		uint32_t tile;
+ 
+ 		// atomic-modesetting only
+ 
+ 		uint32_t crtc_id;
+ 	};
+-	uint32_t props[4];
++	uint32_t props[12];
+ };
+ 
+ union wlr_drm_crtc_props {
+@@ -42,7 +43,7 @@ union wlr_drm_crtc_props {
+ 		uint32_t active;
+ 		uint32_t mode_id;
+ 	};
+-	uint32_t props[6];
++	uint32_t props[5];
+ };
+ 
+ union wlr_drm_plane_props {
+diff --git a/include/backend/drm/util.h b/include/backend/drm/util.h
+index 254f774d..dd17152d 100644
+--- a/include/backend/drm/util.h
++++ b/include/backend/drm/util.h
+@@ -14,6 +14,7 @@ enum wlr_output_mode_aspect_ratio get_picture_aspect_ratio(const drmModeModeInfo
+ const char *get_pnp_manufacturer(const char code[static 3]);
+ // Populates the make/model/phys_{width,height} of output from the edid data
+ void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data);
++void parse_tile(struct wlr_drm_connector *conn, size_t len, const uint8_t *data);
+ const char *drm_connector_status_str(drmModeConnection status);
+ void generate_cvt_mode(drmModeModeInfo *mode, int hdisplay, int vdisplay,
+ 	float vrefresh);
+diff --git a/include/wlr/interfaces/wlr_output.h b/include/wlr/interfaces/wlr_output.h
+index 6c0bbd6c..5a2cadc1 100644
+--- a/include/wlr/interfaces/wlr_output.h
++++ b/include/wlr/interfaces/wlr_output.h
+@@ -23,7 +23,9 @@
+ 	WLR_OUTPUT_STATE_TRANSFORM | \
+ 	WLR_OUTPUT_STATE_RENDER_FORMAT | \
+ 	WLR_OUTPUT_STATE_SUBPIXEL | \
+-	WLR_OUTPUT_STATE_LAYERS)
++	WLR_OUTPUT_STATE_LAYERS | \
++	WLR_OUTPUT_STATE_SRC_BOX | \
++	WLR_OUTPUT_STATE_DST_BOX)
+ 
+ /**
+  * A backend implementation of struct wlr_output.
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index be8253af..d1a847fb 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -15,6 +15,7 @@
+ #include <wayland-server-protocol.h>
+ #include <wayland-util.h>
+ #include <wlr/types/wlr_buffer.h>
++#include <wlr/util/box.h>
+ #include <wlr/util/addon.h>
+ 
+ enum wlr_output_mode_aspect_ratio {
+@@ -64,6 +65,8 @@ enum wlr_output_state_field {
+ 	WLR_OUTPUT_STATE_RENDER_FORMAT = 1 << 8,
+ 	WLR_OUTPUT_STATE_SUBPIXEL = 1 << 9,
+ 	WLR_OUTPUT_STATE_LAYERS = 1 << 10,
++	WLR_OUTPUT_STATE_SRC_BOX = 1 << 11,
++	WLR_OUTPUT_STATE_DST_BOX = 1 << 12,
+ };
+ 
+ enum wlr_output_state_mode_type {
+@@ -105,6 +108,12 @@ struct wlr_output_state {
+ 	// only valid if WLR_OUTPUT_STATE_LAYERS
+ 	struct wlr_output_layer_state *layers;
+ 	size_t layers_len;
++
++	// only valid if WLR_OUTPUT_STATE_SRC_BOX
++	struct wlr_box *src_box; // crop the framebuffer
++
++	// only valid if WLR_OUTPUT_STATE_DST_BOX
++	struct wlr_box *dst_box; // scale the framebuffer
+ };
+ 
+ struct wlr_output_impl;
+@@ -303,6 +312,7 @@ struct wlr_output_mode *wlr_output_preferred_mode(struct wlr_output *output);
+  */
+ void wlr_output_set_mode(struct wlr_output *output,
+ 	struct wlr_output_mode *mode);
++
+ /**
+  * Sets a custom mode on the output.
+  *
+@@ -413,6 +423,7 @@ bool wlr_output_attach_render(struct wlr_output *output, int *buffer_age);
+  */
+ void wlr_output_attach_buffer(struct wlr_output *output,
+ 	struct wlr_buffer *buffer);
++
+ /**
+  * Get the preferred format for reading pixels.
+  * This function might change the current rendering context.
+@@ -537,6 +548,10 @@ const struct wlr_drm_format_set *wlr_output_get_primary_formats(
+  */
+ bool wlr_output_is_direct_scanout_allowed(struct wlr_output *output);
+ 
++void wlr_output_state_set_src_box(struct wlr_output_state *state,
++		struct wlr_box *box);
++void wlr_output_state_set_dst_box(struct wlr_output_state *state,
++		struct wlr_box *box);
+ 
+ struct wlr_output_cursor *wlr_output_cursor_create(struct wlr_output *output);
+ /**
+diff --git a/include/wlr/types/wlr_output_group.h b/include/wlr/types/wlr_output_group.h
+new file mode 100644
+index 00000000..4b6fe3a2
+--- /dev/null
++++ b/include/wlr/types/wlr_output_group.h
+@@ -0,0 +1,65 @@
++#ifndef WLR_USE_UNSTABLE
++#error "Add -DWLR_USE_UNSTABLE to enable unstable wlroots features"
++#endif
++
++#ifndef WLR_TYPES_WLR_OUTPUT_GROUP_H
++#define WLR_TYPES_WLR_OUTPUT_GROUP_H
++
++#include <stdint.h>
++#include <wlr/types/wlr_output_group.h>
++#include <wlr/types/wlr_output.h>
++#include <wlr/render/drm_format_set.h>
++#include <wlr/util/box.h>
++
++struct wlr_output_group_tile_info {
++	uint32_t group_id;
++	uint32_t is_single_monitor;
++	uint32_t num_h;
++	uint32_t num_v;
++	uint32_t h_loc;
++	uint32_t v_loc;
++	uint32_t h_size;
++	uint32_t v_size;
++};
++
++struct wlr_output_group_child {
++	struct wlr_output *output;
++	struct wlr_output_group *group;
++	struct wlr_box src_box;
++	struct wlr_box dst_box;
++	struct wlr_addon addon; // wlr_output.addons
++	struct wlr_output_group_tile_info tile_info;
++	uint32_t index;
++	struct wlr_output_mode *tiled_mode;
++	struct wl_listener present;
++	struct wl_listener frame;
++	struct wl_listener needs_frame;
++	struct wl_listener output_destroy;
++	struct wl_list link;
++};
++
++struct wlr_output_group {
++	struct wlr_output output;
++	/* private data below */
++	int queued_frame_count;
++	int num_children;
++	struct wlr_output_mode *tiled_mode;
++	struct wl_list children; //wlr_output_group_child.link
++	struct wl_list mirrors; //wlr_output_group_child.link
++	struct wlr_drm_format_set cursor_formats;
++	struct wlr_drm_format_set primary_formats;
++	struct wl_display *display;
++	struct wl_listener display_destroy; //for cleanup on shutdown
++	struct wl_event_source *ready;
++	struct wl_list link;
++};
++
++struct wlr_output_group *wlr_output_group_create(struct wl_display *display);
++struct wlr_output_group *wlr_output_group_match_tile(struct wlr_output_group_tile_info *tile_info);
++void wlr_output_group_add_tile(struct wlr_output_group *group, struct wlr_output *output,
++	struct wlr_output_group_tile_info *tile_info);
++void wlr_output_group_add_mirror(struct wlr_output_group *group, struct wlr_output *output);
++void wlr_output_group_remove(struct wlr_output_group *group, struct wlr_output *output);
++void wlr_output_group_ready(struct wlr_output_group *group);
++
++#endif
+diff --git a/types/meson.build b/types/meson.build
+index 9f305e4a..0248a0f7 100644
+--- a/types/meson.build
++++ b/types/meson.build
+@@ -58,6 +58,7 @@ wlr_files += files(
+ 	'wlr_matrix.c',
+ 	'wlr_output_layer.c',
+ 	'wlr_output_layout.c',
++	'wlr_output_group.c',
+ 	'wlr_output_management_v1.c',
+ 	'wlr_output_power_management_v1.c',
+ 	'wlr_pointer_constraints_v1.c',
+diff --git a/types/output/state.c b/types/output/state.c
+index b54c251e..c3854d21 100644
+--- a/types/output/state.c
++++ b/types/output/state.c
+@@ -73,3 +73,15 @@ void wlr_output_state_set_buffer(struct wlr_output_state *state,
+ 	wlr_buffer_unlock(state->buffer);
+ 	state->buffer = wlr_buffer_lock(buffer);
+ }
++
++void wlr_output_state_set_src_box(struct wlr_output_state *state,
++		struct wlr_box *box) {
++	state->committed |= WLR_OUTPUT_STATE_SRC_BOX;
++	state->src_box = box;
++}
++
++void wlr_output_state_set_dst_box(struct wlr_output_state *state,
++		struct wlr_box *box) {
++	state->committed |= WLR_OUTPUT_STATE_DST_BOX;
++	state->dst_box = box;
++}
+diff --git a/types/wlr_output_group.c b/types/wlr_output_group.c
+new file mode 100644
+index 00000000..c85a9348
+--- /dev/null
++++ b/types/wlr_output_group.c
+@@ -0,0 +1,577 @@
++#define _POSIX_C_SOURCE 200809L
++#define _GNU_SOURCE
++#include <assert.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <wayland-util.h>
++#include <wlr/interfaces/wlr_output.h>
++#include <wlr/types/wlr_output_group.h>
++#include <wlr/util/log.h>
++#include <wlr/util/box.h>
++#include "backend/drm/drm.h"
++#include "render/drm_format_set.h"
++
++static const struct wlr_output_impl output_impl;
++static void output_group_child_destroy(struct wlr_output_group_child *child);
++static void output_group_state_change(void *data);
++
++// A global registry for output groups. TODO: can this be attached to the
++// wl_display instead?
++static struct wl_list priv_registry;
++static struct wl_list *registry = NULL;
++
++static struct wlr_output_group *group_from_output(struct wlr_output *output)
++{
++	assert(output->impl == &output_impl);
++	return (struct wlr_output_group *)output;
++}
++
++static void handle_present(struct wl_listener *listener, void *user_data) {
++	struct wlr_output_event_present *event = (struct wlr_output_event_present *) user_data;
++	struct wlr_output_group_child *child = wl_container_of(listener, child, present);
++	struct wlr_output_group *group = child->group;
++	if (group->queued_frame_count > 0) {
++		group->queued_frame_count -= 1;
++	}
++	if (group->queued_frame_count == 0) {
++		wlr_output_send_present(&group->output, event);
++	}
++}
++
++static void handle_frame(struct wl_listener *listener, void *user_data) {
++	struct wlr_output_group_child *child = wl_container_of(listener, child, frame);
++	struct wlr_output_group *group = child->group;
++	/* present happens before frame so trust that backend already did present */
++	if (group->queued_frame_count == 0) {
++		wl_signal_emit_mutable(&group->output.events.frame, &group->output);
++	}
++}
++
++static void handle_needs_frame(struct wl_listener *listener, void *user_data) {
++	struct wlr_output *output = (struct wlr_output *) user_data;
++	struct wlr_output_group_child *child = wl_container_of(listener, child, needs_frame);
++	struct wlr_output_group *group = child->group;
++	/* if any output raises needs_frame, re-raise it */
++	output->needs_frame = false;
++	wlr_output_update_needs_frame(&group->output);
++}
++
++static void handle_output_destroy(struct wl_listener *listener, void *user_data) {
++	struct wlr_output_group_child *child = wl_container_of(listener, child, output_destroy);
++	output_group_child_destroy(child);
++}
++
++static void handle_display_destroy(struct wl_listener *listener, void *user_data) {
++	struct wlr_output_group *group = wl_container_of(listener, group, display_destroy);
++	wlr_output_destroy(&group->output);
++}
++
++struct wlr_output_group_mode {
++	struct wlr_output_mode mode;
++	struct wlr_output_mode *original_mode;
++};
++
++static void clone_output(struct wlr_output *dst_output, struct wlr_output *src_output,
++	struct wlr_output_group_tile_info *tile_info) {
++	wlr_output_init(dst_output, src_output->backend, &output_impl, src_output->display);
++	int new_name_len = strlen(src_output->name) + sizeof("TILE");
++	dst_output->name = malloc(new_name_len);
++	sprintf(dst_output->name, "GROUP-%s", src_output->name);
++	wlr_output_set_description(dst_output, src_output->description);
++	dst_output->make = strdup(src_output->make);
++	dst_output->model = strdup(src_output->model);
++	dst_output->serial = strdup(src_output->serial);
++	dst_output->phys_width = src_output->phys_width;
++	dst_output->phys_height = src_output->phys_height;
++	dst_output->current_mode = src_output->current_mode;
++	dst_output->width = src_output->width;
++	dst_output->height = src_output->height;
++	dst_output->refresh = src_output->refresh;
++	dst_output->enabled = src_output->enabled;
++	dst_output->scale = src_output->scale;
++	dst_output->subpixel = src_output->subpixel;
++	dst_output->transform = src_output->transform;
++	dst_output->adaptive_sync_status = src_output->adaptive_sync_status;
++
++	/* Clone all child modes while keeping references to the original.  This is
++	 * needed because the drm backend uses its own mode container (wlr_drm_mode)
++	 * to link a wlr_mode to a drmModeModeInfo. */
++	struct wlr_output_mode *mode;
++	wl_list_for_each_reverse(mode, &src_output->modes, link) {
++		struct wlr_output_group_mode *group_mode = calloc(1, sizeof(*group_mode));
++		memcpy(&group_mode->mode, mode, sizeof(*mode));
++		group_mode->original_mode = mode;
++		wl_list_insert(&dst_output->modes, &group_mode->mode.link);
++	}
++}
++
++struct wlr_output_group *wlr_output_group_match_tile(struct wlr_output_group_tile_info *tile_info) {
++	if (!registry) {
++		return NULL;
++	}
++	struct wlr_output_group *group;
++	wl_list_for_each(group, registry, link) {
++		struct wlr_output_group_child *child = wl_container_of(group->children.next, child, link);
++		if (child->tile_info.group_id == tile_info->group_id) {
++			return group;
++		}
++	}
++	return NULL;
++}
++
++void wlr_output_group_add_tile(struct wlr_output_group *group, struct wlr_output *output,
++	struct wlr_output_group_tile_info *tile_info) {
++	struct wlr_output_group_child *child = calloc(1, sizeof(*child));
++	assert(tile_info->group_id != 0);
++	child->output = output;
++
++	child->output_destroy.notify = handle_output_destroy;
++	wl_signal_add(&output->events.destroy, &child->output_destroy);
++	child->frame.notify = handle_frame;
++	wl_signal_add(&output->events.frame, &child->frame);
++
++	child->present.notify = handle_present;
++	wl_signal_add(&output->events.present, &child->present);
++	child->needs_frame.notify = handle_needs_frame;
++	wl_signal_add(&output->events.needs_frame, &child->needs_frame);
++
++	child->group = group;
++	child->tile_info = *tile_info;
++
++	/* index is like array v,h:
++	 * #1 [0,0], #2 [0,1], #3 [0,2],
++	 * #4 [1,0], #5 [1,1], #6 [1,2],
++	 * #7 [2,0], #8 [2,1], #9 [2,2],
++	 */
++	child->index = (tile_info->v_loc * tile_info->num_h) + tile_info->h_loc;
++
++	/* sorted insert to keep children in order for calculating tiled mode */
++	struct wlr_output_group_child *cur;
++	wl_list_for_each(cur, &group->children, link) {
++		if (child->index < cur->index) {
++			break;
++		}
++	}
++	wl_list_insert(cur->link.prev, &child->link);
++
++	if (group->ready == NULL) {
++		struct wl_event_loop *ev = wl_display_get_event_loop(child->output->display);
++		group->ready = wl_event_loop_add_idle(ev, output_group_state_change, group);
++	}
++}
++
++struct wlr_output_group *wlr_output_group_create(struct wl_display *display) {
++	if (registry == NULL) {
++		wl_list_init(&priv_registry);
++		registry = &priv_registry;
++	}
++	struct wlr_output_group *group = calloc(1, sizeof(*group));
++	group->display = display;
++	group->display_destroy.notify = handle_display_destroy;
++	wl_display_add_destroy_listener(display, &group->display_destroy);
++	wl_list_insert(registry, &group->link);
++	wl_list_init(&group->children);
++	return group;
++}
++
++static void output_group_destroy(struct wlr_output *output) {
++	struct wlr_output_group *group = group_from_output(output);
++	struct wlr_output_group_child *child,*child_tmp;
++	wl_list_for_each_safe(child, child_tmp, &group->children, link) {
++		output_group_child_destroy(child);
++	}
++	wl_list_remove(&group->display_destroy.link);
++	struct wlr_output_group_mode *mode, *mode_tmp;
++	wl_list_for_each_safe(mode, mode_tmp, &group->output.modes, mode.link) {
++		wl_list_remove(&mode->mode.link);
++		free(mode);
++	}
++	if (group->ready != NULL) {
++		wl_event_source_remove(group->ready);
++	}
++	free(group);
++}
++
++static void output_group_child_destroy(struct wlr_output_group_child *child) {
++	struct wlr_output_group *group = child->group;
++	wlr_log(WLR_DEBUG, "removing child %s from group %s",
++		child->output->name, group->output.name);
++	wl_list_remove(&child->present.link);
++	wl_list_remove(&child->needs_frame.link);
++	wl_list_remove(&child->frame.link);
++	wl_list_remove(&child->output_destroy.link);
++	wl_list_remove(&child->link);
++	/* The reference to the buffer is held by the group. If I still have a
++	 * buffer attached to a child, it will be unlocked during output destroy
++	 * and ref count will try to go negative later. */
++	child->output->pending.buffer = NULL;
++	/* Schedule a group state change event. When all children are removed, the
++	 * output will be destroyed. */
++	if (group->ready == NULL) {
++		struct wl_event_loop *ev = wl_display_get_event_loop(child->output->display);
++		group->ready = wl_event_loop_add_idle(ev, output_group_state_change, group);
++	}
++	free(child);
++}
++
++static bool output_group_commit(struct wlr_output *parent, const struct wlr_output_state *state) {
++	struct wlr_output_group *group = group_from_output(parent);
++	bool ret = false;
++	bool failed = false;
++	bool in_tiled_mode = false;
++
++	if(state->committed & WLR_OUTPUT_STATE_MODE) {
++		if (state->mode == group->tiled_mode) {
++			in_tiled_mode = true;
++		}
++	} else {
++		if (parent->current_mode == group->tiled_mode) {
++			in_tiled_mode = true;
++		}
++	}
++
++	struct wlr_output_group_child *child;
++	bool single_output_enabled = false;
++	int frame_count = 0;
++	wl_list_for_each(child, &group->children, link) {
++		struct wlr_output *output = child->output;
++		struct wlr_output_state *pending = &output->pending;
++
++		*pending = *state;
++
++		/* commit_seq important for presentation feedback! */
++		output->commit_seq = parent->commit_seq;
++
++		if (in_tiled_mode) {
++			frame_count += 1;
++			wlr_output_state_set_src_box(pending, &child->src_box);
++			pending->mode = child->tiled_mode;
++			if (output->enabled == false && !(pending->committed & WLR_OUTPUT_STATE_ENABLED)) {
++				pending->committed |= WLR_OUTPUT_STATE_ENABLED;
++				pending->enabled = true;
++			}
++		} else {
++			frame_count = 1;
++			if (output->enabled == true || (pending->committed & WLR_OUTPUT_STATE_ENABLED && pending->enabled == true)) {
++				if (single_output_enabled == false) {
++					/* first child gets turned on */
++					if ((pending->committed & WLR_OUTPUT_STATE_MODE) && (pending->mode_type == WLR_OUTPUT_STATE_MODE_FIXED)) {
++						struct wlr_output_group_mode *group_mode = wl_container_of(pending->mode, group_mode, mode);
++						pending->mode = group_mode->original_mode;
++					}
++					single_output_enabled = true;
++				} else {
++					/* rest of the children get forced off */
++					pending->committed = WLR_OUTPUT_STATE_ENABLED;
++					pending->enabled = false;
++				}
++			}
++		}
++
++		if (output->enabled == false && !(pending->committed & WLR_OUTPUT_STATE_ENABLED)) {
++			continue;
++		}
++
++		/* TODO: I first tried to use wlr_output_commit() but ran into
++		 * various problems. It does seem like it might be the right
++		 * thing to do, but it also might make sense to go straight to
++		 * the backend and assume the parent manages all the state? */
++		ret = output->impl->commit(output, pending);
++		if(ret == false) {
++			failed = true;
++			wlr_log(WLR_DEBUG, "commit failed on %s", output->name);
++		} else {
++			/* copied from wlr_output_commit_state() */
++			if (pending->committed & WLR_OUTPUT_STATE_MODE) {
++				switch (pending->mode_type) {
++				case WLR_OUTPUT_STATE_MODE_FIXED:
++					wlr_output_update_mode(output, pending->mode);
++					break;
++				case WLR_OUTPUT_STATE_MODE_CUSTOM:
++					wlr_output_update_custom_mode(output,
++						pending->custom_mode.width,
++						pending->custom_mode.height,
++						pending->custom_mode.refresh);
++					break;
++				}
++			}
++			if (pending->committed & WLR_OUTPUT_STATE_ENABLED) {
++				wlr_output_update_enabled(output, pending->enabled);
++			}
++			if (output->frame_pending) {
++				parent->frame_pending = true;
++			}
++		}
++	}
++
++	if (failed) {
++		/* Do not present any frame where any children failed */
++		group->queued_frame_count = -1;
++	} else {
++		/* Synchronize all children outputs to prevent tearing. Make
++		 * sure we get all the children frame/present events before
++		 * forwarding that to the group output. */
++		group->queued_frame_count = frame_count;
++	}
++
++	return !failed;
++}
++
++static size_t output_group_get_gamma_size(struct wlr_output *output) {
++	struct wlr_output_group *group = group_from_output(output);
++	size_t gamma_size = 0;
++	size_t tmp_gamma_size = 0;
++	struct wlr_output_group_child *child;
++	wl_list_for_each(child, &group->children, link) {
++		if (child->output->impl->get_gamma_size) {
++			tmp_gamma_size = child->output->impl->get_gamma_size(child->output);
++		}
++		if (gamma_size == 0) {
++			gamma_size = tmp_gamma_size;
++		}
++		if (tmp_gamma_size == 0 || tmp_gamma_size != gamma_size) {
++			return 0;
++		}
++	}
++	return gamma_size;
++}
++
++static bool output_group_set_cursor(struct wlr_output *output,
++		struct wlr_buffer *buffer, int hotspot_x, int hotspot_y) {
++	struct wlr_output_group *group = group_from_output(output);
++	struct wlr_output_group_child *child;
++	wl_list_for_each(child, &group->children, link) {
++		if (child->output->enabled) {
++			child->output->impl->set_cursor(child->output, buffer, hotspot_x, hotspot_y);
++		}
++	};
++	return true;
++}
++
++static bool output_group_move_cursor(struct wlr_output *output,
++		int x, int y) {
++	struct wlr_output_group *group = group_from_output(output);
++	struct wlr_output *parent = &group->output;
++	struct wlr_output_group_child *child;
++	/* copied from backend/drm.c ;-) */
++	struct wlr_box box = { .x = x, .y = y };
++	int width, height;
++	enum wl_output_transform transform = wlr_output_transform_invert(parent->transform);
++	wlr_output_transformed_resolution(output, &width, &height);
++	wlr_box_transform(&box, &box, transform, width, height);
++	wl_list_for_each(child, &group->children, link) {
++		if (child->output->enabled) {
++			child->output->impl->move_cursor(child->output, box.x - child->src_box.x, box.y - child->src_box.y);
++		}
++	};
++	return true;
++}
++
++static void output_group_get_cursor_size(struct wlr_output *output,
++		int *width, int *height) {
++	struct wlr_output_group *group = group_from_output(output);
++	struct wlr_output_group_child *child;
++	*width = 0;
++	*height = 0;
++	wl_list_for_each(child, &group->children, link) {
++		int child_width=0, child_height=0;
++		if (child->output->impl->get_cursor_size) {
++			child->output->impl->get_cursor_size(child->output, &child_width, &child_height);
++		}
++		if (child_width == 0 || child_height == 0) {
++			*width = 0;
++			*height = 0;
++			return;
++		} else {
++			if (*width == 0 && *height == 0) {
++				*width =  child_width;
++				*height = child_height;
++			} else {
++				if (child_width < *width) {
++					*width = child_width;
++				}
++				if (child_height < *height) {
++					*height = child_height;
++				}
++			}
++		}
++	}
++}
++
++static const struct wlr_drm_format_set *output_group_get_cursor_formats(
++		struct wlr_output *output, uint32_t buffer_caps) {
++	struct wlr_output_group *group = group_from_output(output);
++	struct wlr_output_group_child *child;
++	bool first = true;
++	wl_list_for_each(child, &group->children, link) {
++		if (!child->output->impl->get_cursor_formats) {
++			wlr_drm_format_set_finish(&group->cursor_formats);
++			break;
++		}
++		const struct wlr_drm_format_set *set =
++			child->output->impl->get_cursor_formats(child->output, buffer_caps);
++		if (first) {
++			wlr_drm_format_set_copy(&group->cursor_formats, set);
++			first = false;
++		} else {
++			wlr_drm_format_set_intersect(&group->cursor_formats, &group->cursor_formats, set);
++		}
++	}
++	return &group->cursor_formats;
++}
++
++static const struct wlr_drm_format_set *output_group_get_primary_formats(
++		struct wlr_output *output, uint32_t buffer_caps) {
++	struct wlr_output_group *group = group_from_output(output);
++	bool first = true;
++	struct wlr_output_group_child *child;
++	wl_list_for_each(child, &group->children, link) {
++		if (!child->output->impl->get_primary_formats) {
++			wlr_drm_format_set_finish(&group->primary_formats);
++			break;
++		}
++		const struct wlr_drm_format_set *set =
++			child->output->impl->get_primary_formats(child->output, buffer_caps);
++		if (first) {
++			wlr_drm_format_set_copy(&group->primary_formats, set);
++			first = false;
++		} else {
++			wlr_drm_format_set_intersect(&group->primary_formats, &group->primary_formats, set);
++		}
++	}
++	return &group->primary_formats;
++}
++
++static void calculate_and_allocate_tiled_mode(struct wlr_output_group *group) {
++	struct wlr_output_group_mode *group_mode = calloc(1, sizeof(*group_mode));
++	uint32_t x_start = 0, y_start = 0;
++	struct wlr_output_group_child *child;
++	wl_list_for_each(child, &group->children, link) {
++		struct wlr_output_group_tile_info *tile_info = &child->tile_info;
++
++		/* this depends on iterating through the children in tile index order and
++		 * assumes the dimensions work */
++		if (tile_info->v_loc == 0) {
++			group_mode->mode.width += tile_info->h_size;
++		}
++		if (tile_info->h_loc == 0) {
++			group_mode->mode.height += tile_info->v_size;
++		}
++
++		/* Generate the crop for this specific tile. The source buffer is shared
++		 * between all tiles and each child output takes a subset of the shared
++		 * buffer. */
++		child->src_box.x = x_start;
++		child->src_box.y = y_start;
++		child->src_box.width = tile_info->h_size;
++		child->src_box.height = tile_info->v_size;
++
++		if (tile_info->h_loc == (tile_info->num_h-1)) {
++			x_start = 0;
++			y_start += tile_info->v_size;
++		} else {
++			x_start += tile_info->h_size;
++		}
++
++		struct wlr_output_mode *mode;
++		wl_list_for_each(mode, &child->output->modes, link) {
++			if (mode->width == (int32_t)tile_info->h_size && mode->height == (int32_t)tile_info->v_size) {
++				child->tiled_mode = mode;
++				if ((group_mode->mode.refresh == 0) || (mode->refresh < group_mode->mode.refresh)) {
++					/* slowest refresh wins */
++					group_mode->mode.refresh = mode->refresh;
++				}
++				break;
++			}
++		}
++	}
++	//TODO: set aspect ratio?
++	group_mode->mode.picture_aspect_ratio = WLR_OUTPUT_MODE_ASPECT_RATIO_NONE;
++	group_mode->mode.preferred = true;
++	group->tiled_mode = &group_mode->mode;
++	wl_list_insert(&group->output.modes, &group_mode->mode.link);
++}
++
++static void output_group_state_change(void *data) {
++	struct wlr_output_group *group = data;
++	int num_children = wl_list_length(&group->children);
++	bool need_init = false;
++	bool need_destroy = false;
++	if (group->num_children > 0) {
++		need_destroy = true;
++	}
++
++	if (num_children > 0) {
++		need_init = true;
++	}
++
++	if (need_destroy) {
++		struct wlr_output_group *old_group = group;
++		if (need_init) {
++			struct wlr_output_group *new_group = wlr_output_group_create(old_group->display);
++			struct wlr_output_group_child *child, *child_tmp;
++
++			/* prevent re-entering */
++			new_group->ready = old_group->ready;
++
++			/* disable old group */
++			old_group->output.pending = (struct wlr_output_state) {
++				.committed = WLR_OUTPUT_STATE_ENABLED,
++				.allow_artifacts = true,
++				.enabled = false,
++			};
++			wlr_output_commit(&old_group->output);
++
++			/* move children to new group */
++			wl_list_for_each_safe(child, child_tmp, &group->children, link) {
++				wlr_output_group_add_tile(new_group, child->output, &child->tile_info);
++				output_group_child_destroy(child);
++			}
++
++			/* old group will get free'd during output destroy */
++			group = new_group;
++		}
++
++		wlr_output_destroy(&old_group->output);
++	}
++
++	group->ready = NULL;
++	group->num_children = num_children;
++	if (!need_init) {
++		return;
++	}
++
++	/* the first child is the primary */
++	struct wlr_output_group_child *primary =
++		wl_container_of(group->children.next, primary, link);
++	clone_output(&group->output, primary->output, &primary->tile_info);
++
++	/* calculate and generate mode for the full resolution output */
++	if (num_children > 1) {
++		calculate_and_allocate_tiled_mode(group);
++	}
++
++	if (need_init) {
++		wlr_log(WLR_INFO, "created output group %s, %dx%d (%dx%d mm)",
++			group->output.name, group->tiled_mode->width, group->tiled_mode->height,
++			group->output.phys_width, group->output.phys_height);
++
++		struct wlr_output_mode *mode;
++		wl_list_for_each(mode, &group->output.modes, link) {
++			wlr_log(WLR_DEBUG, "  mode %dx%d@%d", mode->width, mode->height, mode->refresh);
++		}
++		wl_signal_emit_mutable(&primary->output->backend->events.new_output, &group->output);
++	}
++}
++
++static const struct wlr_output_impl output_impl = {
++	.destroy = output_group_destroy,
++	.commit = output_group_commit,
++	.get_gamma_size = output_group_get_gamma_size,
++	.set_cursor = output_group_set_cursor,
++	.move_cursor = output_group_move_cursor,
++	.get_cursor_formats = output_group_get_cursor_formats,
++	.get_cursor_size = output_group_get_cursor_size,
++	.get_primary_formats = output_group_get_primary_formats,
++};
