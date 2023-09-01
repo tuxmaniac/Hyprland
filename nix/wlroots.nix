@@ -8,11 +8,20 @@
   libliftoff,
   enableXWayland ? true,
   enableNvidiaPatches ? false,
+  fetchFromGitLab
 }:
 wlroots.overrideAttrs (old: {
   inherit version src enableXWayland;
 
   pname = "${old.pname}-hyprland${lib.optionalString enableNvidiaPatches "-nvidia"}";
+
+  src = fetchFromGitLab {
+    domain = "gitlab.freedesktop.org";
+    owner = "wlroots";
+    repo = "wlroots";
+    rev = "";
+    sha256 = "0000000000000000000000000000000000000000000000000000";
+  }:
 
   patches =
     (old.patches or [])

@@ -1,8 +1,130 @@
+From 5b8a7378869ea4a4fd6e22814d7a28269dd33c41 Mon Sep 17 00:00:00 2001
+From: EBADBEEF <errno@ebadf.com>
+Date: Tue, 30 May 2023 19:38:42 -0700
+Subject: [PATCH 1/6] output: add src_box and dst_box state fields
+
+---
+ include/wlr/interfaces/wlr_output.h |  4 +++-
+ include/wlr/types/wlr_output.h      | 15 +++++++++++++++
+ types/output/state.c                | 12 ++++++++++++
+ 3 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/include/wlr/interfaces/wlr_output.h b/include/wlr/interfaces/wlr_output.h
+index 6c0bbd6c70..5a2cadc1d9 100644
+--- a/include/wlr/interfaces/wlr_output.h
++++ b/include/wlr/interfaces/wlr_output.h
+@@ -23,7 +23,9 @@
+ 	WLR_OUTPUT_STATE_TRANSFORM | \
+ 	WLR_OUTPUT_STATE_RENDER_FORMAT | \
+ 	WLR_OUTPUT_STATE_SUBPIXEL | \
+-	WLR_OUTPUT_STATE_LAYERS)
++	WLR_OUTPUT_STATE_LAYERS | \
++	WLR_OUTPUT_STATE_SRC_BOX | \
++	WLR_OUTPUT_STATE_DST_BOX)
+ 
+ /**
+  * A backend implementation of struct wlr_output.
+diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
+index a71bf9ca07..55bf1bce08 100644
+--- a/include/wlr/types/wlr_output.h
++++ b/include/wlr/types/wlr_output.h
+@@ -16,6 +16,7 @@
+ #include <wayland-util.h>
+ #include <wlr/render/wlr_renderer.h>
+ #include <wlr/types/wlr_buffer.h>
++#include <wlr/util/box.h>
+ #include <wlr/util/addon.h>
+ 
+ enum wlr_output_mode_aspect_ratio {
+@@ -65,6 +66,8 @@ enum wlr_output_state_field {
+ 	WLR_OUTPUT_STATE_RENDER_FORMAT = 1 << 8,
+ 	WLR_OUTPUT_STATE_SUBPIXEL = 1 << 9,
+ 	WLR_OUTPUT_STATE_LAYERS = 1 << 10,
++	WLR_OUTPUT_STATE_SRC_BOX = 1 << 11,
++	WLR_OUTPUT_STATE_DST_BOX = 1 << 12,
+ };
+ 
+ enum wlr_output_state_mode_type {
+@@ -102,6 +105,12 @@ struct wlr_output_state {
+ 
+ 	struct wlr_output_layer_state *layers;
+ 	size_t layers_len;
++
++	// only valid if WLR_OUTPUT_STATE_SRC_BOX
++	struct wlr_box *src_box; // crop the framebuffer
++
++	// only valid if WLR_OUTPUT_STATE_DST_BOX
++	struct wlr_box *dst_box; // scale the framebuffer
+ };
+ 
+ struct wlr_output_impl;
+@@ -300,6 +309,7 @@ struct wlr_output_mode *wlr_output_preferred_mode(struct wlr_output *output);
+  */
+ void wlr_output_set_mode(struct wlr_output *output,
+ 	struct wlr_output_mode *mode);
++
+ /**
+  * Sets a custom mode on the output.
+  *
+@@ -658,6 +668,7 @@ void wlr_output_state_set_subpixel(struct wlr_output_state *state,
+  */
+ void wlr_output_state_set_buffer(struct wlr_output_state *state,
+ 	struct wlr_buffer *buffer);
++
+ /**
+  * Sets the gamma table for an output. `r`, `g` and `b` are gamma ramps for
+  * red, green and blue. `size` is the length of the ramps and must not exceed
+@@ -702,6 +713,10 @@ void wlr_output_state_set_layers(struct wlr_output_state *state,
+ bool wlr_output_state_copy(struct wlr_output_state *dst,
+ 	const struct wlr_output_state *src);
+ 
++void wlr_output_state_set_src_box(struct wlr_output_state *state,
++		struct wlr_box *box);
++void wlr_output_state_set_dst_box(struct wlr_output_state *state,
++		struct wlr_box *box);
+ 
+ /**
+  * Re-configure the swapchain as required for the output's primary buffer.
+diff --git a/types/output/state.c b/types/output/state.c
+index 41610f0352..29b4fca969 100644
+--- a/types/output/state.c
++++ b/types/output/state.c
+@@ -150,3 +150,15 @@ err:
+ 	wlr_output_state_finish(&copy);
+ 	return false;
+ }
++
++void wlr_output_state_set_src_box(struct wlr_output_state *state,
++		struct wlr_box *box) {
++	state->committed |= WLR_OUTPUT_STATE_SRC_BOX;
++	state->src_box = box;
++}
++
++void wlr_output_state_set_dst_box(struct wlr_output_state *state,
++		struct wlr_box *box) {
++	state->committed |= WLR_OUTPUT_STATE_DST_BOX;
++	state->dst_box = box;
++}
+-- 
+GitLab
+
+
+From 39ecf10fb63165b4fa71999fa7585e1ec0fb6998 Mon Sep 17 00:00:00 2001
+From: EBADBEEF <errno@ebadf.com>
+Date: Tue, 30 May 2023 19:41:32 -0700
+Subject: [PATCH 2/6] backend/drm: handle src_box and dst_box
+
+---
+ backend/drm/atomic.c     | 50 +++++++++++++++++++++++++++-----------
+ backend/drm/drm.c        |  4 +++-
+ backend/drm/libliftoff.c | 52 +++++++++++++++++++++++++++++-----------
+ 3 files changed, 77 insertions(+), 29 deletions(-)
+
 diff --git a/backend/drm/atomic.c b/backend/drm/atomic.c
-index c8ffaff6..19dbec10 100644
+index c2005f9683..64e3e7a361 100644
 --- a/backend/drm/atomic.c
 +++ b/backend/drm/atomic.c
-@@ -207,7 +207,7 @@ static void plane_disable(struct atomic *atom, struct wlr_drm_plane *plane) {
+@@ -230,7 +230,7 @@ static void plane_disable(struct atomic *atom, struct wlr_drm_plane *plane) {
  
  static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
  		struct wlr_drm_plane *plane, struct wlr_drm_fb *fb, uint32_t crtc_id,
@@ -11,7 +133,7 @@ index c8ffaff6..19dbec10 100644
  	uint32_t id = plane->id;
  	const union wlr_drm_plane_props *props = &plane->props;
  
-@@ -217,20 +217,35 @@ static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
+@@ -240,20 +240,35 @@ static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
  		return;
  	}
  
@@ -57,7 +179,7 @@ index c8ffaff6..19dbec10 100644
  }
  
  static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
-@@ -329,8 +344,15 @@ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
+@@ -346,8 +361,15 @@ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
  		if (crtc->props.vrr_enabled != 0) {
  			atomic_add(&atom, crtc->id, crtc->props.vrr_enabled, vrr_enabled);
  		}
@@ -75,7 +197,7 @@ index c8ffaff6..19dbec10 100644
  		if (crtc->primary->props.fb_damage_clips != 0) {
  			atomic_add(&atom, crtc->primary->id,
  				crtc->primary->props.fb_damage_clips, fb_damage_clips);
-@@ -338,7 +360,7 @@ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
+@@ -355,7 +377,7 @@ static bool atomic_crtc_commit(struct wlr_drm_connector *conn,
  		if (crtc->cursor) {
  			if (drm_connector_is_cursor_visible(conn)) {
  				set_plane_props(&atom, drm, crtc->cursor, get_next_cursor_fb(conn),
@@ -85,18 +207,10 @@ index c8ffaff6..19dbec10 100644
  				plane_disable(&atom, crtc->cursor);
  			}
 diff --git a/backend/drm/drm.c b/backend/drm/drm.c
-index cc887a14..522aeabc 100644
+index 5e33454501..e13a06fe93 100644
 --- a/backend/drm/drm.c
 +++ b/backend/drm/drm.c
-@@ -17,6 +17,7 @@
- #include <wlr/interfaces/wlr_output.h>
- #include <wlr/render/wlr_renderer.h>
- #include <wlr/types/wlr_matrix.h>
-+#include <wlr/types/wlr_output_group.h>
- #include <wlr/util/box.h>
- #include <wlr/util/log.h>
- #include <xf86drm.h>
-@@ -41,7 +42,9 @@ static const uint32_t COMMIT_OUTPUT_STATE =
+@@ -41,7 +41,9 @@ static const uint32_t COMMIT_OUTPUT_STATE =
  	WLR_OUTPUT_STATE_ENABLED |
  	WLR_OUTPUT_STATE_GAMMA_LUT |
  	WLR_OUTPUT_STATE_ADAPTIVE_SYNC_ENABLED |
@@ -107,49 +221,11 @@ index cc887a14..522aeabc 100644
  
  static const uint32_t SUPPORTED_OUTPUT_STATE =
  	WLR_OUTPUT_STATE_BACKEND_OPTIONAL | COMMIT_OUTPUT_STATE;
-@@ -1430,6 +1433,12 @@ static bool connect_drm_connector(struct wlr_drm_connector *wlr_conn,
- 	parse_edid(wlr_conn, edid_len, edid);
- 	free(edid);
- 
-+	size_t tile_len = 0;
-+	uint8_t *tile = get_drm_prop_blob(drm->fd,
-+		wlr_conn->id, wlr_conn->props.tile, &tile_len);
-+	parse_tile(wlr_conn, tile_len, tile);
-+	free(tile);
-+
- 	char *subconnector = NULL;
- 	if (wlr_conn->props.subconnector) {
- 		subconnector = get_drm_prop_enum(drm->fd,
-@@ -1620,10 +1629,20 @@ void scan_drm_connectors(struct wlr_drm_backend *drm,
- 
- 	for (size_t i = 0; i < new_outputs_len; ++i) {
- 		struct wlr_drm_connector *conn = new_outputs[i];
--
--		wlr_drm_conn_log(conn, WLR_INFO, "Requesting modeset");
--		wl_signal_emit_mutable(&drm->backend.events.new_output,
--			&conn->output);
-+		if(conn->tile_info.group_id) {
-+			struct wlr_output_group *group = wlr_output_group_match_tile(&conn->tile_info);
-+			if (group) {
-+				wlr_drm_conn_log(conn, WLR_INFO, "Adding %s to existing group", conn->name);
-+			} else {
-+				wlr_drm_conn_log(conn, WLR_INFO, "Creating output group for %s", conn->name);
-+				group = wlr_output_group_create(conn->backend->display);
-+			}
-+			wlr_output_group_add_tile(group, &conn->output, &conn->tile_info);
-+		} else {
-+			wlr_drm_conn_log(conn, WLR_INFO, "Requesting modeset");
-+			wl_signal_emit_mutable(&drm->backend.events.new_output,
-+				&conn->output);
-+		}
- 	}
- }
- 
 diff --git a/backend/drm/libliftoff.c b/backend/drm/libliftoff.c
-index a6afb1f9..9cf80ae2 100644
+index 5b828e1738..fec67f9a89 100644
 --- a/backend/drm/libliftoff.c
 +++ b/backend/drm/libliftoff.c
-@@ -143,25 +143,41 @@ static void rollback_blob(struct wlr_drm_backend *drm,
+@@ -148,25 +148,41 @@ static void rollback_blob(struct wlr_drm_backend *drm,
  }
  
  static bool set_plane_props(struct wlr_drm_plane *plane,
@@ -202,7 +278,7 @@ index a6afb1f9..9cf80ae2 100644
  		liftoff_layer_set_property(layer, "FB_ID", fb->id) == 0;
  }
  
-@@ -383,9 +399,17 @@ static bool crtc_commit(struct wlr_drm_connector *conn,
+@@ -404,9 +420,17 @@ static bool crtc_commit(struct wlr_drm_connector *conn,
  		if (crtc->props.vrr_enabled != 0) {
  			ok = ok && add_prop(req, crtc->id, crtc->props.vrr_enabled, vrr_enabled);
  		}
@@ -220,9 +296,9 @@ index a6afb1f9..9cf80ae2 100644
 +			set_plane_props(crtc->primary, crtc->primary->liftoff_layer, state->primary_fb, 0, 0, 0, src_box, dst_box) &&
 +			set_plane_props(crtc->primary, crtc->liftoff_composition_layer, state->primary_fb, 0, 0, 0, src_box, dst_box);
  		liftoff_layer_set_property(crtc->primary->liftoff_layer,
- 			"FB_DAMAGE_CLIPS", fb_damage_clips);
+ 			"FB_DAMAGE_CLIPS", primary_fb_damage_clips);
  		liftoff_layer_set_property(crtc->liftoff_composition_layer,
-@@ -402,7 +426,7 @@ static bool crtc_commit(struct wlr_drm_connector *conn,
+@@ -424,7 +448,7 @@ static bool crtc_commit(struct wlr_drm_connector *conn,
  			if (drm_connector_is_cursor_visible(conn)) {
  				ok = ok && set_plane_props(crtc->cursor, crtc->cursor->liftoff_layer,
  					get_next_cursor_fb(conn), conn->cursor_x, conn->cursor_y,
@@ -231,210 +307,29 @@ index a6afb1f9..9cf80ae2 100644
  			} else {
  				ok = ok && disable_plane(crtc->cursor);
  			}
-diff --git a/backend/drm/properties.c b/backend/drm/properties.c
-index 4f495177..feb586cb 100644
---- a/backend/drm/properties.c
-+++ b/backend/drm/properties.c
-@@ -25,6 +25,7 @@ static const struct prop_info connector_info[] = {
- 	{ "DPMS", INDEX(dpms) },
- 	{ "EDID", INDEX(edid) },
- 	{ "PATH", INDEX(path) },
-+	{ "TILE", INDEX(tile) },
- 	{ "content type", INDEX(content_type) },
- 	{ "link-status", INDEX(link_status) },
- 	{ "max bpc", INDEX(max_bpc) },
-diff --git a/backend/drm/util.c b/backend/drm/util.c
-index 0e7f3f8b..cc7c6bfa 100644
---- a/backend/drm/util.c
-+++ b/backend/drm/util.c
-@@ -87,6 +87,47 @@ void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data)
- 	di_info_destroy(info);
- }
- 
-+void parse_tile(struct wlr_drm_connector *conn, size_t len, const uint8_t *data) {
-+	struct wlr_output_group_tile_info *tile_info = &conn->tile_info;
-+	memset(tile_info, 0, sizeof(*tile_info));
-+	if (len == 0)
-+		return;
-+
-+	// Reference:
-+	// - include/linux/drm/drm_connector.h tile_blob_ptr
-+	// - drivers/gpu/drm/drm_edid.c drm_parse_tiled_block()
-+	//
-+	// Note: group_id is always > 0
-+	int ret = sscanf((char*)data, "%d:%d:%d:%d:%d:%d:%d:%d",
-+		&tile_info->group_id,
-+		&tile_info->is_single_monitor,
-+		&tile_info->num_h,
-+		&tile_info->num_v,
-+		&tile_info->h_loc,
-+		&tile_info->v_loc,
-+		&tile_info->h_size,
-+		&tile_info->v_size);
-+	if(ret != 8) {
-+		wlr_log(WLR_ERROR, "Unable to understand tile information for "
-+			"connector %s", conn->name);
-+		return;
-+	}
-+
-+	wlr_log(WLR_INFO, "Connector '%s' TILE information: "
-+		"group ID %d, single monitor %d, total %d horizontal tiles, "
-+		"total %d vertical tiles, horizontal tile %d, vertical tile "
-+		"%d, width %d, height %d",
-+		conn->name,
-+		tile_info->group_id,
-+		tile_info->is_single_monitor,
-+		tile_info->num_h,
-+		tile_info->num_v,
-+		tile_info->h_loc,
-+		tile_info->v_loc,
-+		tile_info->h_size,
-+		tile_info->v_size);
-+}
-+
- const char *drm_connector_status_str(drmModeConnection status) {
- 	switch (status) {
- 	case DRM_MODE_CONNECTED:
-diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
-index 4b92c5eb..aab64495 100644
---- a/include/backend/drm/drm.h
-+++ b/include/backend/drm/drm.h
-@@ -11,6 +11,7 @@
- #include <wlr/backend/session.h>
- #include <wlr/render/drm_format_set.h>
- #include <wlr/types/wlr_output_layer.h>
-+#include <wlr/types/wlr_output_group.h>
- #include <xf86drmMode.h>
- #include "backend/drm/iface.h"
- #include "backend/drm/properties.h"
-@@ -161,6 +162,8 @@ struct wlr_drm_connector {
- 	 * they're sent.
- 	 */
- 	uint32_t pending_page_flip_crtc;
-+
-+	struct wlr_output_group_tile_info tile_info;
- };
- 
- struct wlr_drm_backend *get_drm_backend_from_backend(
-diff --git a/include/backend/drm/properties.h b/include/backend/drm/properties.h
-index b6ca14f1..1d79543a 100644
---- a/include/backend/drm/properties.h
-+++ b/include/backend/drm/properties.h
-@@ -22,12 +22,13 @@ union wlr_drm_connector_props {
- 		uint32_t panel_orientation; // not guaranteed to exist
- 		uint32_t content_type; // not guaranteed to exist
- 		uint32_t max_bpc; // not guaranteed to exist
-+		uint32_t tile;
- 
- 		// atomic-modesetting only
- 
- 		uint32_t crtc_id;
- 	};
--	uint32_t props[4];
-+	uint32_t props[12];
- };
- 
- union wlr_drm_crtc_props {
-@@ -42,7 +43,7 @@ union wlr_drm_crtc_props {
- 		uint32_t active;
- 		uint32_t mode_id;
- 	};
--	uint32_t props[6];
-+	uint32_t props[5];
- };
- 
- union wlr_drm_plane_props {
-diff --git a/include/backend/drm/util.h b/include/backend/drm/util.h
-index 254f774d..dd17152d 100644
---- a/include/backend/drm/util.h
-+++ b/include/backend/drm/util.h
-@@ -14,6 +14,7 @@ enum wlr_output_mode_aspect_ratio get_picture_aspect_ratio(const drmModeModeInfo
- const char *get_pnp_manufacturer(const char code[static 3]);
- // Populates the make/model/phys_{width,height} of output from the edid data
- void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data);
-+void parse_tile(struct wlr_drm_connector *conn, size_t len, const uint8_t *data);
- const char *drm_connector_status_str(drmModeConnection status);
- void generate_cvt_mode(drmModeModeInfo *mode, int hdisplay, int vdisplay,
- 	float vrefresh);
-diff --git a/include/wlr/interfaces/wlr_output.h b/include/wlr/interfaces/wlr_output.h
-index 6c0bbd6c..5a2cadc1 100644
---- a/include/wlr/interfaces/wlr_output.h
-+++ b/include/wlr/interfaces/wlr_output.h
-@@ -23,7 +23,9 @@
- 	WLR_OUTPUT_STATE_TRANSFORM | \
- 	WLR_OUTPUT_STATE_RENDER_FORMAT | \
- 	WLR_OUTPUT_STATE_SUBPIXEL | \
--	WLR_OUTPUT_STATE_LAYERS)
-+	WLR_OUTPUT_STATE_LAYERS | \
-+	WLR_OUTPUT_STATE_SRC_BOX | \
-+	WLR_OUTPUT_STATE_DST_BOX)
- 
- /**
-  * A backend implementation of struct wlr_output.
-diff --git a/include/wlr/types/wlr_output.h b/include/wlr/types/wlr_output.h
-index be8253af..d1a847fb 100644
---- a/include/wlr/types/wlr_output.h
-+++ b/include/wlr/types/wlr_output.h
-@@ -15,6 +15,7 @@
- #include <wayland-server-protocol.h>
- #include <wayland-util.h>
- #include <wlr/types/wlr_buffer.h>
-+#include <wlr/util/box.h>
- #include <wlr/util/addon.h>
- 
- enum wlr_output_mode_aspect_ratio {
-@@ -64,6 +65,8 @@ enum wlr_output_state_field {
- 	WLR_OUTPUT_STATE_RENDER_FORMAT = 1 << 8,
- 	WLR_OUTPUT_STATE_SUBPIXEL = 1 << 9,
- 	WLR_OUTPUT_STATE_LAYERS = 1 << 10,
-+	WLR_OUTPUT_STATE_SRC_BOX = 1 << 11,
-+	WLR_OUTPUT_STATE_DST_BOX = 1 << 12,
- };
- 
- enum wlr_output_state_mode_type {
-@@ -105,6 +108,12 @@ struct wlr_output_state {
- 	// only valid if WLR_OUTPUT_STATE_LAYERS
- 	struct wlr_output_layer_state *layers;
- 	size_t layers_len;
-+
-+	// only valid if WLR_OUTPUT_STATE_SRC_BOX
-+	struct wlr_box *src_box; // crop the framebuffer
-+
-+	// only valid if WLR_OUTPUT_STATE_DST_BOX
-+	struct wlr_box *dst_box; // scale the framebuffer
- };
- 
- struct wlr_output_impl;
-@@ -303,6 +312,7 @@ struct wlr_output_mode *wlr_output_preferred_mode(struct wlr_output *output);
-  */
- void wlr_output_set_mode(struct wlr_output *output,
- 	struct wlr_output_mode *mode);
-+
- /**
-  * Sets a custom mode on the output.
-  *
-@@ -413,6 +423,7 @@ bool wlr_output_attach_render(struct wlr_output *output, int *buffer_age);
-  */
- void wlr_output_attach_buffer(struct wlr_output *output,
- 	struct wlr_buffer *buffer);
-+
- /**
-  * Get the preferred format for reading pixels.
-  * This function might change the current rendering context.
-@@ -537,6 +548,10 @@ const struct wlr_drm_format_set *wlr_output_get_primary_formats(
-  */
- bool wlr_output_is_direct_scanout_allowed(struct wlr_output *output);
- 
-+void wlr_output_state_set_src_box(struct wlr_output_state *state,
-+		struct wlr_box *box);
-+void wlr_output_state_set_dst_box(struct wlr_output_state *state,
-+		struct wlr_box *box);
- 
- struct wlr_output_cursor *wlr_output_cursor_create(struct wlr_output *output);
- /**
+-- 
+GitLab
+
+
+From 4813bc6c064c7d78f58f6ccb18c07a3c3c1ec473 Mon Sep 17 00:00:00 2001
+From: EBADBEEF <errno@ebadf.com>
+Date: Tue, 30 May 2023 19:39:48 -0700
+Subject: [PATCH 3/6] output: introduce wlr_output_group
+
+An output group is an output implementation that contains one or more
+separate outputs as children. The children can be grouped together to
+turn into one big output (for a tiled display).
+---
+ include/wlr/types/wlr_output_group.h |  65 +++
+ types/meson.build                    |   1 +
+ types/wlr_output_group.c             | 567 +++++++++++++++++++++++++++
+ 3 files changed, 633 insertions(+)
+ create mode 100644 include/wlr/types/wlr_output_group.h
+ create mode 100644 types/wlr_output_group.c
+
 diff --git a/include/wlr/types/wlr_output_group.h b/include/wlr/types/wlr_output_group.h
 new file mode 100644
-index 00000000..4b6fe3a2
+index 0000000000..4b6fe3a22e
 --- /dev/null
 +++ b/include/wlr/types/wlr_output_group.h
 @@ -0,0 +1,65 @@
@@ -504,10 +399,10 @@ index 00000000..4b6fe3a2
 +
 +#endif
 diff --git a/types/meson.build b/types/meson.build
-index 9f305e4a..0248a0f7 100644
+index de33a8b505..b5c7acb541 100644
 --- a/types/meson.build
 +++ b/types/meson.build
-@@ -58,6 +58,7 @@ wlr_files += files(
+@@ -59,6 +59,7 @@ wlr_files += files(
  	'wlr_matrix.c',
  	'wlr_output_layer.c',
  	'wlr_output_layout.c',
@@ -515,32 +410,12 @@ index 9f305e4a..0248a0f7 100644
  	'wlr_output_management_v1.c',
  	'wlr_output_power_management_v1.c',
  	'wlr_pointer_constraints_v1.c',
-diff --git a/types/output/state.c b/types/output/state.c
-index b54c251e..c3854d21 100644
---- a/types/output/state.c
-+++ b/types/output/state.c
-@@ -73,3 +73,15 @@ void wlr_output_state_set_buffer(struct wlr_output_state *state,
- 	wlr_buffer_unlock(state->buffer);
- 	state->buffer = wlr_buffer_lock(buffer);
- }
-+
-+void wlr_output_state_set_src_box(struct wlr_output_state *state,
-+		struct wlr_box *box) {
-+	state->committed |= WLR_OUTPUT_STATE_SRC_BOX;
-+	state->src_box = box;
-+}
-+
-+void wlr_output_state_set_dst_box(struct wlr_output_state *state,
-+		struct wlr_box *box) {
-+	state->committed |= WLR_OUTPUT_STATE_DST_BOX;
-+	state->dst_box = box;
-+}
 diff --git a/types/wlr_output_group.c b/types/wlr_output_group.c
 new file mode 100644
-index 00000000..c85a9348
+index 0000000000..84cae8347e
 --- /dev/null
 +++ b/types/wlr_output_group.c
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,567 @@
 +#define _POSIX_C_SOURCE 200809L
 +#define _GNU_SOURCE
 +#include <assert.h>
@@ -578,7 +453,8 @@ index 00000000..c85a9348
 +		group->queued_frame_count -= 1;
 +	}
 +	if (group->queued_frame_count == 0) {
-+		wlr_output_send_present(&group->output, event);
++		event->output = &group->output;
++		wl_signal_emit_mutable(&group->output.events.present, event);
 +	}
 +}
 +
@@ -597,7 +473,8 @@ index 00000000..c85a9348
 +	struct wlr_output_group *group = child->group;
 +	/* if any output raises needs_frame, re-raise it */
 +	output->needs_frame = false;
-+	wlr_output_update_needs_frame(&group->output);
++	group->output.needs_frame = true;
++	wl_signal_emit_mutable(&group->output.events.needs_frame, &group->output);
 +}
 +
 +static void handle_output_destroy(struct wl_listener *listener, void *user_data) {
@@ -820,25 +697,11 @@ index 00000000..c85a9348
 +		 * various problems. It does seem like it might be the right
 +		 * thing to do, but it also might make sense to go straight to
 +		 * the backend and assume the parent manages all the state? */
-+		ret = output->impl->commit(output, pending);
++		ret = output->impl->commit(output, &output->pending);
 +		if(ret == false) {
 +			failed = true;
 +			wlr_log(WLR_DEBUG, "commit failed on %s", output->name);
 +		} else {
-+			/* copied from wlr_output_commit_state() */
-+			if (pending->committed & WLR_OUTPUT_STATE_MODE) {
-+				switch (pending->mode_type) {
-+				case WLR_OUTPUT_STATE_MODE_FIXED:
-+					wlr_output_update_mode(output, pending->mode);
-+					break;
-+				case WLR_OUTPUT_STATE_MODE_CUSTOM:
-+					wlr_output_update_custom_mode(output,
-+						pending->custom_mode.width,
-+						pending->custom_mode.height,
-+						pending->custom_mode.refresh);
-+					break;
-+				}
-+			}
 +			if (pending->committed & WLR_OUTPUT_STATE_ENABLED) {
 +				wlr_output_update_enabled(output, pending->enabled);
 +			}
@@ -848,14 +711,16 @@ index 00000000..c85a9348
 +		}
 +	}
 +
-+	if (failed) {
-+		/* Do not present any frame where any children failed */
-+		group->queued_frame_count = -1;
-+	} else {
++	if (failed == false) {
 +		/* Synchronize all children outputs to prevent tearing. Make
 +		 * sure we get all the children frame/present events before
 +		 * forwarding that to the group output. */
 +		group->queued_frame_count = frame_count;
++		if (state->committed & WLR_OUTPUT_STATE_MODE) {
++			/* commit the mode to the parent display, this is
++			 * normally handled in the drm backend */
++			wlr_output_update_mode(parent, state->mode);
++		}
 +	}
 +
 +	return !failed;
@@ -1118,3 +983,312 @@ index 00000000..c85a9348
 +	.get_cursor_size = output_group_get_cursor_size,
 +	.get_primary_formats = output_group_get_primary_formats,
 +};
+-- 
+GitLab
+
+
+From 9b7c4624631cc77fb4908698d129423608c07cba Mon Sep 17 00:00:00 2001
+From: EBADBEEF <errno@ebadf.com>
+Date: Tue, 30 May 2023 19:42:51 -0700
+Subject: [PATCH 4/6] backend/drm: parse TILE property
+
+---
+ backend/drm/drm.c                |  7 ++++++
+ backend/drm/properties.c         |  1 +
+ backend/drm/util.c               | 41 ++++++++++++++++++++++++++++++++
+ include/backend/drm/drm.h        |  3 +++
+ include/backend/drm/properties.h |  5 ++--
+ include/backend/drm/util.h       |  1 +
+ 6 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index e13a06fe93..6cce179843 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -17,6 +17,7 @@
+ #include <wlr/interfaces/wlr_output.h>
+ #include <wlr/render/wlr_renderer.h>
+ #include <wlr/types/wlr_matrix.h>
++#include <wlr/types/wlr_output_group.h>
+ #include <wlr/util/box.h>
+ #include <wlr/util/log.h>
+ #include <xf86drm.h>
+@@ -1416,6 +1417,12 @@ static bool connect_drm_connector(struct wlr_drm_connector *wlr_conn,
+ 	parse_edid(wlr_conn, edid_len, edid);
+ 	free(edid);
+ 
++	size_t tile_len = 0;
++	uint8_t *tile = get_drm_prop_blob(drm->fd,
++		wlr_conn->id, wlr_conn->props.tile, &tile_len);
++	parse_tile(wlr_conn, tile_len, tile);
++	free(tile);
++
+ 	char *subconnector = NULL;
+ 	if (wlr_conn->props.subconnector) {
+ 		subconnector = get_drm_prop_enum(drm->fd,
+diff --git a/backend/drm/properties.c b/backend/drm/properties.c
+index 4f49517712..feb586cb54 100644
+--- a/backend/drm/properties.c
++++ b/backend/drm/properties.c
+@@ -25,6 +25,7 @@ static const struct prop_info connector_info[] = {
+ 	{ "DPMS", INDEX(dpms) },
+ 	{ "EDID", INDEX(edid) },
+ 	{ "PATH", INDEX(path) },
++	{ "TILE", INDEX(tile) },
+ 	{ "content type", INDEX(content_type) },
+ 	{ "link-status", INDEX(link_status) },
+ 	{ "max bpc", INDEX(max_bpc) },
+diff --git a/backend/drm/util.c b/backend/drm/util.c
+index 0e7f3f8b19..cc7c6bfaf4 100644
+--- a/backend/drm/util.c
++++ b/backend/drm/util.c
+@@ -87,6 +87,47 @@ void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data)
+ 	di_info_destroy(info);
+ }
+ 
++void parse_tile(struct wlr_drm_connector *conn, size_t len, const uint8_t *data) {
++	struct wlr_output_group_tile_info *tile_info = &conn->tile_info;
++	memset(tile_info, 0, sizeof(*tile_info));
++	if (len == 0)
++		return;
++
++	// Reference:
++	// - include/linux/drm/drm_connector.h tile_blob_ptr
++	// - drivers/gpu/drm/drm_edid.c drm_parse_tiled_block()
++	//
++	// Note: group_id is always > 0
++	int ret = sscanf((char*)data, "%d:%d:%d:%d:%d:%d:%d:%d",
++		&tile_info->group_id,
++		&tile_info->is_single_monitor,
++		&tile_info->num_h,
++		&tile_info->num_v,
++		&tile_info->h_loc,
++		&tile_info->v_loc,
++		&tile_info->h_size,
++		&tile_info->v_size);
++	if(ret != 8) {
++		wlr_log(WLR_ERROR, "Unable to understand tile information for "
++			"connector %s", conn->name);
++		return;
++	}
++
++	wlr_log(WLR_INFO, "Connector '%s' TILE information: "
++		"group ID %d, single monitor %d, total %d horizontal tiles, "
++		"total %d vertical tiles, horizontal tile %d, vertical tile "
++		"%d, width %d, height %d",
++		conn->name,
++		tile_info->group_id,
++		tile_info->is_single_monitor,
++		tile_info->num_h,
++		tile_info->num_v,
++		tile_info->h_loc,
++		tile_info->v_loc,
++		tile_info->h_size,
++		tile_info->v_size);
++}
++
+ const char *drm_connector_status_str(drmModeConnection status) {
+ 	switch (status) {
+ 	case DRM_MODE_CONNECTED:
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index 4b92c5eb3f..aab6449532 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -11,6 +11,7 @@
+ #include <wlr/backend/session.h>
+ #include <wlr/render/drm_format_set.h>
+ #include <wlr/types/wlr_output_layer.h>
++#include <wlr/types/wlr_output_group.h>
+ #include <xf86drmMode.h>
+ #include "backend/drm/iface.h"
+ #include "backend/drm/properties.h"
+@@ -161,6 +162,8 @@ struct wlr_drm_connector {
+ 	 * they're sent.
+ 	 */
+ 	uint32_t pending_page_flip_crtc;
++
++	struct wlr_output_group_tile_info tile_info;
+ };
+ 
+ struct wlr_drm_backend *get_drm_backend_from_backend(
+diff --git a/include/backend/drm/properties.h b/include/backend/drm/properties.h
+index 103d125934..fa9e1d3df8 100644
+--- a/include/backend/drm/properties.h
++++ b/include/backend/drm/properties.h
+@@ -23,12 +23,13 @@ union wlr_drm_connector_props {
+ 		uint32_t panel_orientation; // not guaranteed to exist
+ 		uint32_t content_type; // not guaranteed to exist
+ 		uint32_t max_bpc; // not guaranteed to exist
++		uint32_t tile;
+ 
+ 		// atomic-modesetting only
+ 
+ 		uint32_t crtc_id;
+ 	};
+-	uint32_t props[4];
++	uint32_t props[12];
+ };
+ 
+ union wlr_drm_crtc_props {
+@@ -43,7 +44,7 @@ union wlr_drm_crtc_props {
+ 		uint32_t active;
+ 		uint32_t mode_id;
+ 	};
+-	uint32_t props[6];
++	uint32_t props[5];
+ };
+ 
+ union wlr_drm_plane_props {
+diff --git a/include/backend/drm/util.h b/include/backend/drm/util.h
+index 254f774da3..dd17152de1 100644
+--- a/include/backend/drm/util.h
++++ b/include/backend/drm/util.h
+@@ -14,6 +14,7 @@ enum wlr_output_mode_aspect_ratio get_picture_aspect_ratio(const drmModeModeInfo
+ const char *get_pnp_manufacturer(const char code[static 3]);
+ // Populates the make/model/phys_{width,height} of output from the edid data
+ void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data);
++void parse_tile(struct wlr_drm_connector *conn, size_t len, const uint8_t *data);
+ const char *drm_connector_status_str(drmModeConnection status);
+ void generate_cvt_mode(drmModeModeInfo *mode, int hdisplay, int vdisplay,
+ 	float vrefresh);
+-- 
+GitLab
+
+
+From 0b950065ef0dc7f6f79553e3913da09144cbf06f Mon Sep 17 00:00:00 2001
+From: EBADBEEF <errno@ebadf.com>
+Date: Tue, 30 May 2023 19:43:16 -0700
+Subject: [PATCH 5/6] backend/drm: automatically use wlr_output_group for tiled
+ outputs
+
+---
+ backend/drm/drm.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index 6cce179843..dc8ed5ac99 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -1613,10 +1613,20 @@ void scan_drm_connectors(struct wlr_drm_backend *drm,
+ 
+ 	for (size_t i = 0; i < new_outputs_len; ++i) {
+ 		struct wlr_drm_connector *conn = new_outputs[i];
+-
+-		wlr_drm_conn_log(conn, WLR_INFO, "Requesting modeset");
+-		wl_signal_emit_mutable(&drm->backend.events.new_output,
+-			&conn->output);
++		if(conn->tile_info.group_id) {
++			struct wlr_output_group *group = wlr_output_group_match_tile(&conn->tile_info);
++			if (group) {
++				wlr_drm_conn_log(conn, WLR_INFO, "Adding %s to existing group", conn->name);
++			} else {
++				wlr_drm_conn_log(conn, WLR_INFO, "Creating output group for %s", conn->name);
++				group = wlr_output_group_create(conn->backend->display);
++			}
++			wlr_output_group_add_tile(group, &conn->output, &conn->tile_info);
++		} else {
++			wlr_drm_conn_log(conn, WLR_INFO, "Requesting modeset");
++			wl_signal_emit_mutable(&drm->backend.events.new_output,
++				&conn->output);
++		}
+ 	}
+ }
+ 
+-- 
+GitLab
+
+
+From d2cb6caba389cea5303c22abcaa79903049446f7 Mon Sep 17 00:00:00 2001
+From: EBADBEEF <errno@ebadf.com>
+Date: Fri, 11 Aug 2023 17:03:34 -0700
+Subject: [PATCH 6/6] output: rebase output group to master
+
+- Manually call wlr_output_update_mode like in the normal commit path
+  (before 824339938530a3f13c006fa4eefa263a974a3cab, the backend handled
+  updating the current_mode).
+- Never raise the parent present event when any child commits fail.
+  Otherwise we can get in a state when switching VTs where every
+  subsequent commit fails with "a page-flip is already pending". I think
+  there is a race and this case happens when commit fails after "DRM fd
+  paused".
+- Use wlr_output helper functions in some places instead of manually
+  setting the output values.
+---
+ types/wlr_output_group.c | 32 +++++++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/types/wlr_output_group.c b/types/wlr_output_group.c
+index 84cae8347e..c85a934866 100644
+--- a/types/wlr_output_group.c
++++ b/types/wlr_output_group.c
+@@ -35,8 +35,7 @@ static void handle_present(struct wl_listener *listener, void *user_data) {
+ 		group->queued_frame_count -= 1;
+ 	}
+ 	if (group->queued_frame_count == 0) {
+-		event->output = &group->output;
+-		wl_signal_emit_mutable(&group->output.events.present, event);
++		wlr_output_send_present(&group->output, event);
+ 	}
+ }
+ 
+@@ -55,8 +54,7 @@ static void handle_needs_frame(struct wl_listener *listener, void *user_data) {
+ 	struct wlr_output_group *group = child->group;
+ 	/* if any output raises needs_frame, re-raise it */
+ 	output->needs_frame = false;
+-	group->output.needs_frame = true;
+-	wl_signal_emit_mutable(&group->output.events.needs_frame, &group->output);
++	wlr_output_update_needs_frame(&group->output);
+ }
+ 
+ static void handle_output_destroy(struct wl_listener *listener, void *user_data) {
+@@ -279,11 +277,25 @@ static bool output_group_commit(struct wlr_output *parent, const struct wlr_outp
+ 		 * various problems. It does seem like it might be the right
+ 		 * thing to do, but it also might make sense to go straight to
+ 		 * the backend and assume the parent manages all the state? */
+-		ret = output->impl->commit(output, &output->pending);
++		ret = output->impl->commit(output, pending);
+ 		if(ret == false) {
+ 			failed = true;
+ 			wlr_log(WLR_DEBUG, "commit failed on %s", output->name);
+ 		} else {
++			/* copied from wlr_output_commit_state() */
++			if (pending->committed & WLR_OUTPUT_STATE_MODE) {
++				switch (pending->mode_type) {
++				case WLR_OUTPUT_STATE_MODE_FIXED:
++					wlr_output_update_mode(output, pending->mode);
++					break;
++				case WLR_OUTPUT_STATE_MODE_CUSTOM:
++					wlr_output_update_custom_mode(output,
++						pending->custom_mode.width,
++						pending->custom_mode.height,
++						pending->custom_mode.refresh);
++					break;
++				}
++			}
+ 			if (pending->committed & WLR_OUTPUT_STATE_ENABLED) {
+ 				wlr_output_update_enabled(output, pending->enabled);
+ 			}
+@@ -293,16 +305,14 @@ static bool output_group_commit(struct wlr_output *parent, const struct wlr_outp
+ 		}
+ 	}
+ 
+-	if (failed == false) {
++	if (failed) {
++		/* Do not present any frame where any children failed */
++		group->queued_frame_count = -1;
++	} else {
+ 		/* Synchronize all children outputs to prevent tearing. Make
+ 		 * sure we get all the children frame/present events before
+ 		 * forwarding that to the group output. */
+ 		group->queued_frame_count = frame_count;
+-		if (state->committed & WLR_OUTPUT_STATE_MODE) {
+-			/* commit the mode to the parent display, this is
+-			 * normally handled in the drm backend */
+-			wlr_output_update_mode(parent, state->mode);
+-		}
+ 	}
+ 
+ 	return !failed;
+-- 
+GitLab
+
