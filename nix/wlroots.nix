@@ -20,7 +20,7 @@ wlroots.overrideAttrs (old: {
     owner = "wlroots";
     repo = "wlroots";
     rev = "c74f89d4f84bfed0284d3908aee5d207698c70c5";
-    sha256 = "0000000000000000000000000000000000000000000000000000";
+    hash = "sha256-LlxE3o3UzRY7APYVLGNKM30DBMcDifCRIQiMVSbYLIc=";
   };
 
   patches =
