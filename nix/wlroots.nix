@@ -21,7 +21,7 @@ wlroots.overrideAttrs (old: {
     repo = "wlroots";
     rev = "";
     sha256 = "0000000000000000000000000000000000000000000000000000";
-  }:
+  };
 
   patches =
     (old.patches or [])
