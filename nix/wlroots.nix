@@ -19,7 +19,7 @@ wlroots.overrideAttrs (old: {
     domain = "gitlab.freedesktop.org";
     owner = "wlroots";
     repo = "wlroots";
-    rev = "";
+    rev = "c74f89d4f84bfed0284d3908aee5d207698c70c5";
     sha256 = "0000000000000000000000000000000000000000000000000000";
   };
 
