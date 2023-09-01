@@ -18,7 +18,7 @@ wlroots.overrideAttrs (old: {
     (old.patches or [])
     ++ (lib.optionals enableNvidiaPatches [
       ./patches/wlroots-nvidia.patch
-    ]);
+    ])
     ++ [
       # https://gitlab.freedesktop.org/wlroots/wlroots/-/merge_requests/4154
       ./patches/wlr_output_group.patch
